@@ -1,0 +1,85 @@
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface2: #1c2230;
+  --surface3: #222b3a;
+  --border: #242d3d;
+  --border2: #2e3a50;
+  --border3: #3a4a64;
+  --accent: #4d8eff;
+  --accent-dim: rgba(77,142,255,0.14);
+  --accent-glow: rgba(77,142,255,0.28);
+  --green: #3dd68c;
+  --green-dim: rgba(61,214,140,0.13);
+  --red: #ff5e5e;
+  --red-dim: rgba(255,94,94,0.13);
+  --yellow: #fbbf24;
+  --yellow-dim: rgba(251,191,36,0.13);
+  --text: #f0f6ff;
+  --text2: #8b9dc3;
+  --text3: #4a5c78;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+  --radius: 8px;
+  --radius-sm: 5px;
+  --radius-lg: 12px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  height: 100%;
+  overflow-x: hidden;
+  background-image: radial-gradient(circle, #1e2a3d 1px, transparent 1px);
+  background-size: 28px 28px;
+  background-attachment: fixed;
+}
+
+#root { height: 100%; }
+
+button { font-family: var(--sans); cursor: pointer; }
+input, select { font-family: var(--sans); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border3); }
+
+.mono { font-family: var(--mono); }
+
+input:focus, select:focus {
+  outline: none;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.page-enter {
+  animation: fade-up 0.18s cubic-bezier(0.16,1,0.3,1) both;
+}
