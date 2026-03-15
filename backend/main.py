@@ -2,29 +2,30 @@ import asyncio
 import json
 import ipaddress
 import os
+import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 import docker
 from docker.errors import NotFound, APIError
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, field_validator, HttpUrl
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, field_validator
 
-# ─── CORS origins ──────────────────────────────────────────────────────────
-# Defaults to localhost only. Override via ALLOWED_ORIGINS env var (comma-separated).
+# ─── CORS ──────────────────────────────────────────────────────────────────
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3500,http://localhost:5173")
 ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app = FastAPI(title="DockerHQ", version="1.0.0")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["Content-Type"],
 )
 
@@ -41,9 +42,53 @@ def get_client():
     return docker_client
 
 
+# ─── SQLite persistence ────────────────────────────────────────────────────
+# Data stored in a named volume so it survives container restarts.
+# Mount /data as a Docker volume to persist across recreates.
+DB_PATH = Path(os.getenv("DATA_DIR", "/data")) / "dockerhq.db"
+
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with get_db() as db:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS services (
+                id       TEXT PRIMARY KEY,
+                name     TEXT NOT NULL,
+                url      TEXT NOT NULL,
+                icon     TEXT DEFAULT '🔗',
+                description TEXT DEFAULT '',
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            );
+            CREATE TABLE IF NOT EXISTS monitor_targets (
+                id    TEXT PRIMARY KEY,
+                name  TEXT NOT NULL,
+                host  TEXT NOT NULL,
+                port  INTEGER NOT NULL,
+                label TEXT DEFAULT '',
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            );
+        """)
+
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
 # ─── Models ────────────────────────────────────────────────────────────────
 
-# Strict allowlist — never accept arbitrary action strings from the URL
 class ContainerAction(str, Enum):
     start = "start"
     stop = "stop"
@@ -51,30 +96,24 @@ class ContainerAction(str, Enum):
     remove = "remove"
 
 
-# Private/loopback addresses that must not be probed via the monitor
 _BLOCKED_NETS = [
-    ipaddress.ip_network("169.254.0.0/16"),  # link-local
-    ipaddress.ip_network("100.64.0.0/10"),   # shared address space
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
 ]
 
 
 def _is_allowed_host(host: str) -> bool:
-    """Block RFC-1918 ranges except localhost, which is intentionally useful."""
     try:
         addr = ipaddress.ip_address(host)
-        # Allow loopback (127.x.x.x) — that's the common case for local containers
         if addr.is_loopback:
             return True
-        # Block link-local and other special ranges
         for net in _BLOCKED_NETS:
             if addr in net:
                 return False
-        # Block private ranges that aren't loopback — prevents probing Docker internal nets
         if addr.is_private:
             return False
         return True
     except ValueError:
-        # It's a hostname, not a bare IP — allow it (DNS resolution happens later)
         return True
 
 
@@ -126,9 +165,8 @@ class MonitorTarget(BaseModel):
 @app.get("/api/containers")
 def list_containers():
     client = get_client()
-    containers = client.containers.list(all=True)
     result = []
-    for c in containers:
+    for c in client.containers.list(all=True):
         ports = {}
         if c.ports:
             for internal, bindings in c.ports.items():
@@ -150,7 +188,6 @@ def list_containers():
 
 @app.post("/api/containers/{container_id}/{action}")
 def container_action(container_id: str, action: ContainerAction):
-    """Action is validated against the ContainerAction enum — no arbitrary strings accepted."""
     client = get_client()
     try:
         container = client.containers.get(container_id)
@@ -172,7 +209,7 @@ def container_action(container_id: str, action: ContainerAction):
 @app.get("/api/containers/{container_id}/logs")
 def get_logs(
     container_id: str,
-    tail: int = Query(default=200, ge=1, le=2000),  # hard cap prevents OOM
+    tail: int = Query(default=200, ge=1, le=2000),
 ):
     client = get_client()
     try:
@@ -194,7 +231,6 @@ async def stream_logs(websocket: WebSocket, container_id: str):
         await websocket.close()
         return
 
-    # Run blocking Docker log iterator in a thread so we don't block the event loop
     log_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
     stop_event = asyncio.Event()
 
@@ -214,7 +250,7 @@ async def stream_logs(websocket: WebSocket, container_id: str):
             pass
 
     loop = asyncio.get_event_loop()
-    reader_task = loop.run_in_executor(None, _read_logs)
+    loop.run_in_executor(None, _read_logs)
 
     try:
         while True:
@@ -222,7 +258,6 @@ async def stream_logs(websocket: WebSocket, container_id: str):
                 msg = await asyncio.wait_for(log_queue.get(), timeout=1.0)
                 await websocket.send_text(json.dumps(msg))
             except asyncio.TimeoutError:
-                # Send a keepalive ping to detect dead connections
                 try:
                     await websocket.send_text(json.dumps({"ping": True}))
                 except Exception:
@@ -255,38 +290,41 @@ def system_info():
     }
 
 
-# ─── Health Monitor ────────────────────────────────────────────────────────
-
-# NOTE: These are in-process lists. They are intentionally simple for a
-# single-worker deployment. If you run uvicorn with --workers > 1, switch
-# to a persistent store (SQLite, Redis) instead.
-_monitor_targets: list[dict] = []
-
+# ─── Health Monitor — SQLite-backed ───────────────────────────────────────
 
 @app.get("/api/monitor/targets")
 def get_targets():
-    return _monitor_targets
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM monitor_targets ORDER BY created_at").fetchall()
+        return [dict(r) for r in rows]
 
 
 @app.post("/api/monitor/targets")
 def add_target(target: MonitorTarget):
-    entry = target.model_dump()
-    entry["id"] = f"{target.host}:{target.port}"
-    if not any(t["id"] == entry["id"] for t in _monitor_targets):
-        _monitor_targets.append(entry)
+    tid = f"{target.host}:{target.port}"
+    entry = {**target.model_dump(), "id": tid}
+    with get_db() as db:
+        existing = db.execute("SELECT id FROM monitor_targets WHERE id = ?", (tid,)).fetchone()
+        if not existing:
+            db.execute(
+                "INSERT INTO monitor_targets (id, name, host, port, label) VALUES (?, ?, ?, ?, ?)",
+                (tid, target.name, target.host, target.port, target.label or ""),
+            )
     return entry
 
 
 @app.delete("/api/monitor/targets/{target_id}")
 def remove_target(target_id: str):
-    global _monitor_targets
-    _monitor_targets = [t for t in _monitor_targets if t["id"] != target_id]
+    with get_db() as db:
+        db.execute("DELETE FROM monitor_targets WHERE id = ?", (target_id,))
     return {"removed": target_id}
 
 
 @app.get("/api/monitor/results")
 async def get_results():
     now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        targets = [dict(r) for r in db.execute("SELECT * FROM monitor_targets").fetchall()]
 
     async def _check(target: dict) -> tuple[str, dict]:
         host, port = target["host"], target["port"]
@@ -302,33 +340,35 @@ async def get_results():
         except Exception:
             return target["id"], {"status": "down", "latency_ms": None, "checked_at": now}
 
-    # Run all checks concurrently instead of sequentially
-    checks = await asyncio.gather(*[_check(t) for t in _monitor_targets])
+    checks = await asyncio.gather(*[_check(t) for t in targets])
     return dict(checks)
 
 
-# ─── Services Dashboard ────────────────────────────────────────────────────
-
-_services: list[dict] = []
-
+# ─── Services Dashboard — SQLite-backed ───────────────────────────────────
 
 @app.get("/api/services")
 def get_services():
-    return _services
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM services ORDER BY created_at").fetchall()
+        return [dict(r) for r in rows]
 
 
 @app.post("/api/services")
 def add_service(service: ServiceConfig):
-    entry = service.model_dump()
-    entry["id"] = str(int(time.time() * 1000))
-    _services.append(entry)
+    sid = str(int(time.time() * 1000))
+    entry = {**service.model_dump(), "id": sid}
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO services (id, name, url, icon, description) VALUES (?, ?, ?, ?, ?)",
+            (sid, service.name, service.url, service.icon or "🔗", service.description or ""),
+        )
     return entry
 
 
 @app.delete("/api/services/{service_id}")
 def remove_service(service_id: str):
-    global _services
-    _services = [s for s in _services if s.get("id") != service_id]
+    with get_db() as db:
+        db.execute("DELETE FROM services WHERE id = ?", (service_id,))
     return {"removed": service_id}
 
 
@@ -341,11 +381,9 @@ try:
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
-        # Return 404 JSON for unmatched /api/* paths instead of silently
-        # serving index.html, which would hide routing bugs
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail=f"No route: /{full_path}")
         return FileResponse(f"{FRONTEND_DIST}/index.html")
 
 except Exception:
-    pass  # Dev mode — frontend served by Vite
+    pass  # Dev mode
