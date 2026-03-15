@@ -5,7 +5,12 @@ services:
     ports:
       - "3500:8000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - dockerhq_data:/data
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+      - DATA_DIR=/data
+
+volumes:
+  dockerhq_data:
