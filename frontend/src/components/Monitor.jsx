@@ -89,12 +89,16 @@ export default function Monitor({ containers }) {
   }
 
   const importContainers = async () => {
+    const seen = new Set(targets.map(t => `${t.host}:${t.port}`))
     const toAdd = []
     for (const c of containers) {
       for (const [, hostPorts] of Object.entries(c.ports || {})) {
         for (const hp of hostPorts) {
           const port = Number(hp)
-          if (!targets.find(t => t.host === 'localhost' && t.port === port)) {
+          const key = `localhost:${port}`
+          // Skip if already monitored OR already queued in this import batch
+          if (!seen.has(key)) {
+            seen.add(key)
             toAdd.push({ name: c.name.replace(/^\//, ''), host: 'localhost', port, label: c.image })
           }
         }
