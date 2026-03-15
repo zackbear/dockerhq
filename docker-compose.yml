@@ -5,7 +5,7 @@ services:
     ports:
       - "3500:8000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock:rw
       - dockerhq_data:/data
     restart: unless-stopped
     environment:
